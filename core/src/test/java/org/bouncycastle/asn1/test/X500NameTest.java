@@ -686,6 +686,112 @@ public class X500NameTest
         throws Exception
     {
         IETFUtils.valueToString(new DERUTF8String(" "));
+
+        // RFC 4514 escaping - also a regression guard for the linear (non O(n^2)) valueToString.
+        isEquals("plain", "abc", IETFUtils.valueToString(new DERUTF8String("abc")));
+        isEquals("comma", "a\\,b", IETFUtils.valueToString(new DERUTF8String("a,b")));
+        isEquals("all specials", "\\,\\\"\\\\\\+\\=\\<\\>\\;",
+            IETFUtils.valueToString(new DERUTF8String(",\"\\+=<>;")));
+        isEquals("leading space", "\\ ab", IETFUtils.valueToString(new DERUTF8String(" ab")));
+        isEquals("trailing space", "ab\\ ", IETFUtils.valueToString(new DERUTF8String("ab ")));
+        isEquals("leading+trailing space", "\\ ab\\ ", IETFUtils.valueToString(new DERUTF8String(" ab ")));
+        isEquals("all spaces", "\\ \\ \\ ", IETFUtils.valueToString(new DERUTF8String("   ")));
+        isEquals("interior space kept", "a b", IETFUtils.valueToString(new DERUTF8String("a b")));
+        isEquals("leading hash", "\\#abc", IETFUtils.valueToString(new DERUTF8String("#abc")));
+        isEquals("non-leading hash kept", "a#b", IETFUtils.valueToString(new DERUTF8String("a#b")));
+
+        // A large all-special value must escape every character and complete in linear time (the
+        // previous insert-into-the-buffer-being-scanned loop was O(n^2)).
+        int n = 100000;
+        StringBuilder commas = new StringBuilder(n);
+        for (int i = 0; i < n; i++)
+        {
+            commas.append(',');
+        }
+        String escaped = IETFUtils.valueToString(new DERUTF8String(commas.toString()));
+        isEquals("large all-comma value fully escaped", 2 * n, escaped.length());
+
+        // CVE-2026-58059: an attacker-supplied RDN made of many RFC 4514 special characters, or many
+        // leading / trailing spaces, must not make X500Name.toString() quadratic.
+        largeRdnEscapingTimeTest(',', "x", "x", "\\,");
+        largeRdnEscapingTimeTest(' ', "", "x", "\\ ");
+        largeRdnEscapingTimeTest(' ', "x", "", "\\ ");
+
+        // equals() and hashCode() reach the same escaping through canonicalize() and must be linear too.
+        largeRdnCompareTimeTest(repeatChar(',', 1000000));
+        largeRdnCompareTimeTest(repeatChar(' ', 1000000) + "x");
+        largeRdnCompareTimeTest("x" + repeatChar(' ', 1000000));
+
+        // A value made only of spaces is escaped as "\ \ ...": canonicalize() (used by equals() and
+        // hashCode()) must not cross its start/end indexes on it.
+        for (int k = 1; k <= 3; k++)
+        {
+            String spaces = repeatChar(' ', k);
+            X500Name a = new X500Name(new RDN[]{ new RDN(BCStyle.CN, new DERUTF8String(spaces)) });
+            X500Name b = new X500Name(new RDN[]{ new RDN(BCStyle.CN, new DERPrintableString(spaces)) });
+            isTrue(k + " space value: equals", a.equals(b));
+            isEquals(k + " space value: hashCode", a.hashCode(), b.hashCode());
+        }
+    }
+
+    private void largeRdnCompareTimeTest(String value)
+    {
+        // different string types force the canonicalizing comparison rather than an encoding match.
+        X500Name utf8Name = new X500Name(new RDN[]{ new RDN(BCStyle.CN, new DERUTF8String(value)) });
+        X500Name printableName = new X500Name(new RDN[]{ new RDN(BCStyle.CN, new DERPrintableString(value)) });
+
+        long start = System.currentTimeMillis();
+        boolean equal = utf8Name.equals(printableName);
+        long elapsed = System.currentTimeMillis() - start;
+
+        isTrue("large RDN equals", equal);
+        isTrue("X500Name.equals() of a " + value.length() + " char RDN took " + elapsed + "ms (quadratic escaping)",
+            elapsed < 2000);
+
+        start = System.currentTimeMillis();
+        int h1 = utf8Name.hashCode();
+        int h2 = printableName.hashCode();
+        elapsed = System.currentTimeMillis() - start;
+
+        isEquals("large RDN hashCode", h1, h2);
+        isTrue("X500Name.hashCode() of a " + value.length() + " char RDN took " + elapsed + "ms (quadratic escaping)",
+            elapsed < 2000);
+    }
+
+    private static String repeatChar(char c, int n)
+    {
+        StringBuilder sb = new StringBuilder(n);
+        for (int i = 0; i < n; i++)
+        {
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    private void largeRdnEscapingTimeTest(char fill, String prefix, String suffix, String escapedFill)
+    {
+        // quadratic escaping takes tens of seconds here, the linear pass a few milliseconds.
+        int n = 1000000;
+        StringBuilder v = new StringBuilder(prefix.length() + n + suffix.length());
+        v.append(prefix);
+        for (int i = 0; i < n; i++)
+        {
+            v.append(fill);
+        }
+        v.append(suffix);
+
+        X500Name name = new X500Name(new RDN[]{ new RDN(BCStyle.CN, new DERUTF8String(v.toString())) });
+
+        long start = System.currentTimeMillis();
+        String str = name.toString();
+        long elapsed = System.currentTimeMillis() - start;
+
+        isEquals("large RDN escaped length", 3 + prefix.length() + n * escapedFill.length() + suffix.length(),
+            str.length());
+        isTrue("large RDN escaped prefix", str.startsWith("CN=" + prefix + escapedFill));
+        isTrue("large RDN escaped suffix", str.endsWith(escapedFill + suffix));
+        isTrue("X500Name.toString() of a " + n + " char RDN took " + elapsed + "ms (quadratic escaping)",
+            elapsed < 2000);
     }
 
     /*
